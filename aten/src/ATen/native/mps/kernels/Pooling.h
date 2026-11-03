@@ -37,6 +37,7 @@ struct PoolingParams {
   ::c10::metal::array<idx_type_t, N - 2> dilation;
   bool return_indices;
   bool adaptive;
+  bool channels_last;
 };
 
 template <unsigned N = 5, typename idx_type_t = int32_t>
@@ -55,17 +56,6 @@ struct AvgPoolingParams {
   bool has_divisor_override;
   bool adaptive;
   bool channels_last;
-};
-
-template <unsigned N = 5, typename idx_type_t = int32_t>
-struct PoolingBackwardParams {
-  int32_t dims;
-  int32_t pooling_dims;
-  ::c10::metal::array<idx_type_t, N> grad_input_sizes;
-  ::c10::metal::array<idx_type_t, N> grad_input_strides;
-  ::c10::metal::array<idx_type_t, N> grad_output_sizes;
-  ::c10::metal::array<idx_type_t, N> grad_output_strides;
-  ::c10::metal::array<idx_type_t, N> indices_strides;
 };
 
 template <unsigned N = 5, typename idx_type_t = int32_t>
