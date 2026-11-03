@@ -6,8 +6,8 @@ The prompt holds the PR title and description, the diff, and every test file
 CI can run annotated with its CI cost. Nothing from the change is executed:
 in CI this script runs from the default branch and only reads the PR through git. The model answers through `claude -p`
 with a JSON schema; on Bedrock set CLAUDE_CODE_USE_BEDROCK=1 and AWS
-credentials. Any failure yields a run_all selection, so CI never skips tests
-because the selector broke.
+credentials. Any failure yields a run_all selection that is never enforced, so
+CI keeps TD's split when the selector broke.
 """
 
 from __future__ import annotations
@@ -261,6 +261,7 @@ def select(args: argparse.Namespace, record: dict) -> Selection | None:
     with contextlib.redirect_stdout(sys.stderr):
         test_times = get_test_times()
     if not test_times and not args.print_prompt:
+        record["error"] = "no test times"
         return Selection(run_all=True, reason="no test times")
     diffstat, diff = diffstat_and_diff(merge_base, args.head)
     # TESTS comes from the checkout this script runs from, which in CI is the
@@ -323,7 +324,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--enforce",
         action="store_true",
-        help="tell run_test.py to skip uncovered files",
+        help="tell run_test.py, on PRs with TD on, to run the covered files, the files that already failed on the PR and a hedge of TD's top files instead of TD's split; ignored when the selector fails, and run_test.py keeps TD's split when it has no test times (test-times.json missing)",
     )
     parser.add_argument("--print-prompt", action="store_true")
     args = parser.parse_args(argv)
@@ -355,7 +356,10 @@ def main(argv: list[str] | None = None) -> None:
         selection = Selection(run_all=True, reason=f"selector failed: {error[:500]}")
     if selection is None:
         return
-    selection.enforce = args.enforce
+    # A deliberate run_all (test infrastructure, too many changed files, an
+    # inductor failure list naming an unknown class, too many import hops, or
+    # the model) is enforced; a broken selector leaves TD's split in place.
+    selection.enforce = args.enforce and record["error"] is None
     args.output.write_text(json.dumps({**selection.to_json(), **record}, indent=1))
     print(
         f"LLM TD: run_all={selection.run_all} sweeps={sorted(selection.sweeps)} files={len(selection.files)}"

@@ -2,26 +2,37 @@
 
 A selection names test files (paths under test/ without .py), whole test
 directories, and wrapper sweeps (configs such as dynamo_wrapped that re-run
-ordinary test files in a special mode). A test file runs in a given CI config
-when the selection names the file, names that config as a sweep, or is run_all,
-and so does every test file the model was not shown.
+ordinary test files in a special mode). A test file is covered in a given CI
+config when the selection names the file, names that config as a sweep, or is
+run_all, and so is every test file the model was not shown. When run_test.py
+enforces the selection, it runs the covered files plus, within a hedge budget,
+the files that already failed on the PR and TD's top-scored files.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from tools.testing.target_determination.heuristics.edited_by_pr import (
     ADDITIONAL_MAPPINGS,
 )
+from tools.testing.target_determination.heuristics.previously_failed_in_pr import (
+    get_previous_failures,
+    read_additional_test_failures_file,
+)
+from tools.testing.target_determination.heuristics.utils import get_pr_number
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Collection
     from pathlib import Path
+
+    from tools.testing.test_run import TestRun
 
 
 SWEEPS = ("dynamo_wrapped", "crossref")
@@ -30,6 +41,12 @@ LLM_TD_SELECTION_FILE = "llm_td_selection.json"
 MAX_IMPORT_HOPS = 8
 # More edited failure-list classes than this are not looked up one by one.
 MAX_FAILURE_LIST_CLASSES = 50
+# When enforcing, run_test.py also runs, greedily in rank order, the files that
+# already failed on the PR and then TD's positively scored files, as long as
+# they have a known time and fit in this share (20%) of the config's test time
+# (all shards together): TD and the model miss largely different failures.
+LLM_TD_HEDGE = 0.20
+
 
 # Tests that run the files a change matches although they do not import them:
 # the drivers of the directories discover_tests.py blocklists (except
@@ -171,6 +188,19 @@ def needs_run_all(changed_files: list[str]) -> bool:
     return any(re.search(p, f) for p in RUN_ALL_PATTERNS for f in changed_files)
 
 
+def previous_failures() -> set[str]:
+    """The test files that already failed on this PR, or none if the files are malformed."""
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            failed = get_previous_failures() | read_additional_test_failures_file()
+        if not all(isinstance(f, str) for f in failed):
+            raise TypeError(f"test files must be strings: {failed!r}")
+        return failed
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError) as e:
+        print(f"Ignoring the previous failures: {e!r}", file=sys.stderr)
+        return set()
+
+
 def parse_model_output(out: object, candidates: set[str]) -> tuple[set[str], set[str]]:
     """The files and sweeps a model answer names; ValueError if it is malformed.
 
@@ -207,8 +237,8 @@ class Selection:
     sweeps: set[str] = field(default_factory=set)
     run_all: bool = False
     reason: str = ""
-    # Whether run_test.py should skip the files the selection does not cover,
-    # rather than only reporting what it would have skipped.
+    # Whether run_test.py should replace TD's split with Selection.split rather
+    # than only reporting it. It does so only on PRs with TD enabled.
     enforce: bool = False
     # The test files the model chose from. Any other file, such as a custom
     # run_test.py handler or a C++ test, is always covered. None covers no extra file.
@@ -259,6 +289,41 @@ class Selection:
             return True
         return self.run_all or test_config in self.sweeps or test_file in self.files
 
+    def split(
+        self,
+        ranked: list[TestRun],
+        score: Callable[[TestRun], float],
+        file_time: dict[str, float],
+        test_config: str,
+        *,
+        previously_failed: Collection[str] = (),
+    ) -> Split:
+        """Split TD's ranked TestRuns into the covered files, the
+        `previously_failed` files (those that already failed on the PR), which
+        always run whatever their size or TD score, and a hedge. The previous
+        failures are charged first to a budget of LLM_TD_HEDGE (20%) of the
+        config's test time; what is left (at least 0) is spent greedily in
+        rank order on the files with a positively scored TestRun. One positive
+        class-level run hedges its whole file at the file's full time. Files
+        without a time are never hedged. Partial TestRuns of one file share
+        its time, so a file is charged once and lands in one batch."""
+        files = dict.fromkeys(x.test_file for x in ranked)
+        covered = {f for f in files if self.covers(f, test_config)}
+        prev = {f for f in files if f in previously_failed} - covered
+        budget = LLM_TD_HEDGE * sum(file_time.get(f, 0) for f in files)
+        left = max(0.0, budget - sum(file_time.get(f, 0) for f in prev))
+        hedged: set[str] = set()
+        chosen = covered | prev
+        for x in ranked:
+            f, t = x.test_file, file_time.get(x.test_file, 0)
+            if f not in chosen and score(x) > 0 and t and t <= left:
+                left -= t
+                hedged.add(f)
+                chosen.add(f)
+        include = [x for x in ranked if x.test_file in chosen]
+        exclude = [x for x in ranked if x.test_file not in chosen]
+        return Split(include, exclude, covered, prev, hedged, budget)
+
     def to_json(self) -> dict:
         return {
             "files": sorted(self.files),
@@ -271,19 +336,141 @@ class Selection:
 
     @classmethod
     def from_json(cls, d: dict) -> Selection:
+        files, sweeps = d["files"], d["sweeps"]
+        run_all, enforce = d["run_all"], d.get("enforce", False)
+        candidates = d.get("candidates")
+        if not all(
+            isinstance(v, list) and all(isinstance(x, str) for x in v)
+            for v in (files, sweeps) + (() if candidates is None else (candidates,))
+        ):
+            raise TypeError("files, sweeps and candidates must be lists of strings")
+        if not isinstance(run_all, bool) or not isinstance(enforce, bool):
+            raise TypeError("run_all and enforce must be booleans")
         return cls(
-            set(d["files"]),
-            set(d["sweeps"]),
-            d["run_all"],
+            set(files),
+            set(sweeps),
+            run_all,
             d.get("reason", ""),
-            d.get("enforce", False),
-            None if d.get("candidates") is None else set(d["candidates"]),
+            enforce,
+            None if candidates is None else set(candidates),
         )
 
     @classmethod
     def load(cls, path: Path) -> Selection | None:
+        if not path.exists():
+            return None
         try:
             with open(path) as f:
                 return cls.from_json(json.load(f))
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, RecursionError) as e:
+            print(
+                f"::warning::Ignoring the LLM selection in {path}: {e!r}",
+                file=sys.stderr,
+            )
             return None
+
+
+@dataclass
+class Split:
+    """Selection.split's result: the TestRuns to run and to skip, and which
+    files run because they are covered, already failed on the PR or are hedged
+    (disjoint sets), and the hedge budget in seconds."""
+
+    include: list[TestRun]
+    exclude: list[TestRun]
+    covered: set[str]
+    previously_failed: set[str]
+    hedged: set[str]
+    budget: float
+
+
+@dataclass
+class AppliedSelection:
+    """A Selection applied to TD's split of one CI config in run_test.py.
+
+    include and exclude are the split to run: the selection's when enforced,
+    TD's otherwise."""
+
+    selection: Selection
+    test_config: str
+    td_enabled: bool
+    enforced: bool
+    include: list[TestRun]
+    exclude: list[TestRun]
+    td_include: set[str]
+    split: Split
+    selection_metric: dict[str, object]
+
+    def failure_metric(self, test: TestRun) -> dict[str, object]:
+        f = test.test_file
+        return {
+            "failure": str(test),
+            "covered": self.selection.covers(f, self.test_config),
+            "enforced": self.enforced,
+            "td_enabled": self.td_enabled,
+            "in_td_include": f in self.td_include,
+            "hedged": f in self.split.hedged,
+            "previously_failed": f in self.split.previously_failed,
+        }
+
+
+def apply_selection(
+    selection: Selection,
+    include: list[TestRun],
+    exclude: list[TestRun],
+    score: Callable[[TestRun], float],
+    test_times: dict[str, float],
+    *,
+    test_config: str,
+    td_enabled: bool,
+) -> AppliedSelection:
+    """Apply the selection to TD's (include, exclude) split.
+
+    The selection replaces TD's split only on a PR with TD enabled and the
+    selection's enforce set, and only if some of the files have a test time.
+    run_test.py falls back to the default job's times for a config without its
+    own, so in practice that fails only without test-times.json."""
+    ranked = include + exclude
+    td_include = {x.test_file for x in include}
+    # Partial TestRuns of one file share its time, so account per file.
+    files = list(dict.fromkeys(x.test_file for x in ranked))
+    file_time = {f: test_times.get(f, 0) for f in files}
+    time_total = sum(file_time.values())
+    enforced = td_enabled and selection.enforce and get_pr_number() is not None
+    if enforced and not time_total:
+        enforced = False
+        print("LLM selection: no test times, using TD", file=sys.stderr)
+    split = selection.split(
+        ranked, score, file_time, test_config, previously_failed=previous_failures()
+    )
+    if enforced:
+        include, exclude = split.include, split.exclude
+        print(
+            f"LLM selection: running {len({x.test_file for x in include})} of {len(files)} test files ({len(split.covered)} selected; {len(split.previously_failed)} previously failed and {len(split.hedged)} hedged within {split.budget:.0f}s)",
+            file=sys.stderr,
+        )
+    metric: dict[str, object] = {
+        "enforced": enforced,
+        "td_enabled": td_enabled,
+        "run_all": selection.run_all,
+        "num_tests": len(files),
+        "num_covered": len(split.covered),
+        "num_td_include": len(td_include),
+        "num_hedged": len(split.hedged),
+        "num_previously_failed": len(split.previously_failed),
+        "time_total": time_total,
+        "time_covered": sum(file_time[f] for f in split.covered),
+        "time_hedged": sum(file_time[f] for f in split.hedged),
+        "time_previously_failed": sum(file_time[f] for f in split.previously_failed),
+    }
+    return AppliedSelection(
+        selection,
+        test_config,
+        td_enabled,
+        enforced,
+        include,
+        exclude,
+        td_include,
+        split,
+        metric,
+    )
