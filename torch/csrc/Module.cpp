@@ -53,6 +53,7 @@
 #include <torch/csrc/DynamicTypes.h>
 #include <torch/csrc/Event.h>
 #include <torch/csrc/Export.h>
+#include <torch/csrc/FakeTensorMode.h>
 #include <torch/csrc/Generator.h>
 #include <torch/csrc/Layout.h>
 #include <torch/csrc/MemoryFormat.h>
@@ -2964,6 +2965,10 @@ Call this whenever a new thread is created in order to propagate values from
                 std::make_shared<c10::SafePyObject>(
                     converter.inc_ref().ptr(), getPyInterpreter()),
                 functorch_config.attr("fake_tensor_allow_meta").cast<bool>());
+            mode->allow_unsafe_data_ptr_access_ =
+                functorch_config
+                    .attr("fake_tensor_allow_unsafe_data_ptr_access")
+                    .cast<bool>();
             PyObject* weakref = PyWeakref_NewRef(wrapper.ptr(), nullptr);
             if (weakref == nullptr) {
               throw py::error_already_set();
@@ -2975,7 +2980,67 @@ Call this whenever a new thread is created in order to propagate values from
           py::arg("converter"),
           py::arg("shape_env"),
           py::arg("wrapper"))
-      .def_readwrite("allow_meta", &c10::FakeTensorMode::allow_meta_);
+      .def_readwrite("allow_meta", &c10::FakeTensorMode::allow_meta_)
+      .def_readwrite(
+          "allow_unsafe_data_ptr_access",
+          &c10::FakeTensorMode::allow_unsafe_data_ptr_access_);
+
+  // The C++ counterpart of Python's FakeTensorConverter.from_meta_and_device.
+  // It takes no pytype or dispatch_keys: a C++ fake is always a plain Tensor
+  // (a Parameter carries the _is_param marker instead), and callers record
+  // anything else on the result.
+  py_module.def(
+      "_from_meta_and_device",
+      [](const at::Tensor& meta,
+         c10::Device device,
+         const std::shared_ptr<c10::FakeTensorMode>& mode) {
+        TORCH_CHECK(mode != nullptr, "Expected a C++ FakeTensorMode");
+        TORCH_CHECK(
+            meta.is_meta(),
+            "tensor's device must be 'meta', got ",
+            meta.device().type());
+        TORCH_CHECK(
+            device.type() != c10::DeviceType::Meta || mode->allow_meta_,
+            "device.type must not be 'meta' when allow_meta is False");
+        TORCH_CHECK(
+            !meta.key_set().has(c10::DispatchKey::Python),
+            "Expected a plain meta tensor");
+        auto* impl = meta.unsafeGetTensorImpl();
+        // A fake reads as meta on the meta device or inside a kernel, and
+        // Python accepts it then too.
+        TORCH_CHECK(
+            !impl->is_fake() || impl->fake_tensor_mode() == mode,
+            "Expected a fake of the given mode");
+        // Like Python's FakeTensor(mode, meta, device), which goes through
+        // _make_subclass: a new detached fake sharing meta's storage, made
+        // without dispatching. meta itself is left unchanged.
+        c10::intrusive_ptr<c10::TensorImpl> out_impl;
+        {
+          // Otherwise an active dispatch mode would run the detach
+          c10::impl::ExcludeDispatchKeyGuard no_python(
+              c10::DispatchKey::Python);
+          out_impl = impl->shallow_copy_and_detach(
+              impl->version_counter(), /*allow_tensor_metadata_change=*/true);
+        }
+        out_impl->set_real_tensor(nullptr);
+        at::set_and_normalize_fake_device(out_impl.get(), device);
+        out_impl->set_fake_tensor_mode(mode);
+        at::Tensor out(std::move(out_impl));
+        out.set_requires_grad(meta.requires_grad());
+        return out;
+      },
+      py::arg("meta"),
+      py::arg("device"),
+      py::arg("mode"));
+
+  // The Python wrapper of a C++ fake's mode, or None for any other tensor.
+  py_module.def("_maybe_get_fake_mode", [](const at::Tensor& t) -> py::object {
+    if (!t.defined() || !t.is_fake()) {
+      return py::none();
+    }
+    return torch::fake_tensor::getCppFakeTensorModePyObj(
+        t.unsafeGetTensorImpl()->fake_tensor_mode());
+  });
 
   py_module.def("_storage_Use_Count", [](size_t storage_impl_ptr) {
     // NOLINTNEXTLINE(performance-no-int-to-ptr)
