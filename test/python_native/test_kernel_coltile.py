@@ -542,6 +542,12 @@ class TestOrderedColRoute(TestCase):
             (1, (128, 2048), (10, 0), True),
             (1, (127, 2048), (10, 0), False),
             (1, (128, 2047), (10, 0), False),
+            (1, (1, 32768, 128), (10, 0), True),
+            (1, (1, 32768, 127), (10, 0), False),
+            (1, (1, 24577, 128), (10, 0), True),
+            (1, (1, 24576, 128), (10, 0), False),
+            (1, (2, 32768, 128), (10, 0), False),
+            (2, (1, 32768, 16384), (10, 0), False),
         ],
         name_fn=lambda nfields, shape, cc, routed: "_".join(
             [f"{nfields}f", "x".join(map(str, shape)), f"sm{cc[0]}{cc[1]}"]
@@ -590,6 +596,15 @@ class TestOrderedColRoute(TestCase):
         narrow = ct._OrderedColReduce(trait, plan, 1024, (1 << 21) - 1, 1)
         wide = ct._OrderedColReduce(trait, plan, 1024, 1 << 21, 1)
         self.assertEqual((narrow.wide, wide.wide), (False, True))
+
+    @parametrize("columns", [512, 1024])
+    def test_general_norm_splits_need_wide_columns(self, columns):
+        view = torch.empty((1, 32768, columns), device="meta")
+        self.assertTrue(kg._ordered_col_route_ok(view, 1, (10, 0)))
+        routed = kg._ordered_col_route_ok(view, 1, (10, 0), general_norm=True)
+        self.assertEqual(routed, columns >= 1024)
+        self.assertTrue(kg._general_norm(T.NormOps(3)))
+        self.assertFalse(kg._general_norm(T.NormOps(2)))
 
 
 class TestOrderedColHost(TestCase):
