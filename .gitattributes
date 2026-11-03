@@ -14,3 +14,4 @@ tools/testing/llm_td/eval/ids/dev.txt linguist-generated=true
 tools/testing/llm_td/eval/ids/eval.txt linguist-generated=true
 tools/testing/llm_td/eval/ids/head.txt linguist-generated=true
 tools/testing/llm_td/eval/ids/neutral.txt linguist-generated=true
+tools/testing/llm_td/report_tradeoff.svg linguist-generated=true

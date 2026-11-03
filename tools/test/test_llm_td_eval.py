@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 from tools.testing.llm_td import select_tests
-from tools.testing.llm_td.eval import build_dataset as bd, score
+from tools.testing.llm_td.eval import build_dataset as bd, chart, dollars, score
 from tools.testing.llm_td.eval.build_dataset import flaky_flags, strip_trailers
 from tools.testing.llm_td.eval.run_eval import run_one
 from tools.testing.llm_td.eval.score import (
@@ -558,6 +558,126 @@ class TestScore(unittest.TestCase):
         self.assertEqual(
             cost_fraction(Choice(Selection(run_all=True)), cands, SECONDS), (1.0, 1.0)
         )
+
+
+class TestChart(unittest.TestCase):
+    def test_frontier(self) -> None:
+        points: list[tuple[float, float]] = [(1, 50), (3, 70), (1, 60), (2, 55), (0.5, 40), (3, 70)]  # fmt: skip
+        self.assertEqual(chart.frontier(points), [(0.5, 40), (1, 60), (3, 70)])
+
+    def test_caught(self) -> None:
+        row = {"tag": "t", "policy": "p", "kind": "k", "files": 1, "run_all": False, "cpu": 0.1, "gpu": 0.1, "cost_usd": 0.1, "error": False}  # fmt: skip
+        rows = [{**row, "pairs": p, "hit": h} for p, h in [(2, 1), (1, 1), (0, 0)]]
+        (s,) = score.summarize(rows)
+        # A revert is caught by any selected failure, a PR push only by all of them.
+        self.assertEqual(chart.caught(s, "revert"), (100.0, 2))
+        self.assertEqual(chart.caught(s, "head"), (50.0, 2))
+        (empty,) = score.summarize(rows[2:])
+        with self.assertRaises(SystemExit):
+            chart.caught(empty, "head")
+
+
+LABELER = """\
+"ciflow/inductor":
+- torch/_inductor/**
+
+- c10/core/Sym*
+"ciflow/other":
+- torch/foo.py
+"""
+
+
+class TestDollars(unittest.TestCase):
+    def write(self, files: dict[str, object]) -> Path:
+        data = Path(self.enterContext(tempfile.TemporaryDirectory[str]()))
+        for name, obj in files.items():
+            (data / name).parent.mkdir(parents=True, exist_ok=True)
+            text = obj if isinstance(obj, str) else json.dumps(obj)
+            (data / name).write_text(text)
+        return data
+
+    def test_inductor_globs(self) -> None:
+        data = self.write({"labeler.yml": LABELER, "bad.yml": '"ciflow/x":\n- y\n'})
+        globs = dollars.inductor_globs(data / "labeler.yml")
+        for path, match in [
+            ("torch/_inductor/codegen/a.py", True),
+            ("c10/core/SymInt.h", True),
+            ("c10/core/impl/SymInt.h", False),
+            ("torch/foo.py", False),
+        ]:
+            self.assertEqual(bool(globs.fullmatch(path)), match, path)
+        with self.assertRaises(SystemExit):
+            dollars.inductor_globs(data / "bad.yml")
+
+    def test_model(self) -> None:
+        sample = {
+            "kind": "neutral",
+            "sha": "x",
+            "candidates": ["test_a", "test_b", "test_c"],
+        }
+        td = {"scored": [], "top25": ["test_a"], "top25_cfg": {"default": ["test_a"]}}
+        result = {"out": {"tests": [{"file": "test_b"}]}, "error": None}
+        data = self.write({
+            "labeler.yml": LABELER,
+            "test-times.json": {
+                "linux": {"default": {"test_a": 80.0, "test_b": 20.0}, "inductor_core": {"test_c": 100.0}},
+                "linux-cuda": {"default": {"test_a": 50.0, "test_b": 50.0}},
+            },
+            "samples/a.json": {**sample, "changed_files": ["torch/_inductor/x.py"]},
+            "samples/b.json": {**sample, "changed_files": ["torch/foo.py"]},
+            "samples/c.json": {**sample, "changed_files": ["torch/foo.py"]},
+            "td/a.json": td, "td/b.json": td, "td/c.json": td,
+            "results/m/a.json": {**result, "cost_usd": 0.2},
+            "results/m/b.json": {**result, "cost_usd": None},
+        })  # fmt: skip
+        jobs = {True: {("pull", "linux", "default")}, False: {("inductor", "unit-test / inductor", "inductor_core")}}  # fmt: skip
+        workflows = [
+            ("pull", "cpu", 100.0, 0.5, 0.2, True),
+            ("inductor", "ind_cpu", 10.0, 1.0, 0.0, False),
+        ]
+        with (
+            patch_ci_jobs(jobs),
+            mock.patch.object(dollars, "ci_jobs", lambda: jobs),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            d = dollars.model(data, "m", "final", 0.2, ["a", "b", "c"], ["a", "b"], data / "samples", data / "td", data / "labeler.yml", workflows)  # fmt: skip
+            today = dollars.model(data, "td", "td25", 0.2, ["a", "b", "c"], ["a", "b"], data / "samples", data / "td", data / "labeler.yml", workflows)  # fmt: skip
+        self.assertEqual(
+            (today["llm_k_per_month"], today["stack_k_per_month"]), (0.0, 0.0)
+        )
+        # c has no m result, so TD is averaged over a and b too.
+        self.assertEqual(d["fractions"], {"cpu": 0.2, "gpu": 0.5, "ind_cpu": 0.0, "ind_gpu": 0.0, "n": 2, "n_ind": 1})  # fmt: skip
+        self.assertEqual(d["td_fractions"], {"cpu": 0.8, "gpu": 0.5, "ind_cpu": 0.0, "ind_gpu": 0.0, "n": 2, "n_ind": 1})  # fmt: skip
+        # pull: 100 * 0.5 PR * 0.8 same-repo, rescaled by (0.2 + 0.8 * 0.2) / (0.2 + 0.8 * 0.8).
+        pull, ind = d["rows"]
+        self.assertAlmostEqual(pull["save_k"], 40 * (1 - 0.36 / 0.84))
+        self.assertAlmostEqual(ind["save_k"], 10 * (1 - 0.2))
+        self.assertAlmostEqual(d["stack_k_per_month"], pull["save_k"])
+        self.assertAlmostEqual(d["total_k_per_month"]["cpu"], pull["save_k"] + 8)
+        # The call without a recorded cost is left out of the mean.
+        llm = d["llm_k_per_month"]
+        self.assertAlmostEqual(llm, 0.2 * dollars.PR_PUSHES_PER_MONTH_K)
+
+    def test_fractions_find_importers(self) -> None:
+        # The change edits test_b, which test_a imports, so final runs test_a too, as score.score does.
+        data = self.write({
+            "labeler.yml": LABELER,
+            "test-times.json": {"linux": {"default": {"test_a": 80.0, "test_b": 20.0}}},
+            "samples/a.json": {"kind": "neutral", "sha": "x", "candidates": ["test_a", "test_b"], "changed_files": ["test/test_b.py", "torch/_inductor/x.py"]},
+            "td/a.json": {"scored": [], "top25": [], "top25_cfg": {}},
+            "results/m/a.json": {"out": {"tests": [{"file": "test_b"}]}, "error": None},
+        })  # fmt: skip
+        jobs = {True: {("pull", "linux", "default")}, False: {("inductor", "unit-test / inductor", "inductor_core")}}  # fmt: skip
+        with (
+            patch_ci_jobs(jobs),
+            mock.patch.object(dollars, "ci_jobs", lambda: jobs),
+            mock.patch.object(
+                score, "grep_at", return_value=["test/test_a.py"]
+            ) as grep,
+        ):
+            f = dollars.fractions(data, ["a"], "m", "final", data / "samples", data / "td", data / "labeler.yml")  # fmt: skip
+        self.assertEqual({c.args[1] for c in grep.call_args_list}, {"x"})
+        self.assertEqual(f["cpu"], 1.0)
 
 
 class TestBuildDataset(unittest.TestCase):
