@@ -118,15 +118,21 @@ RUN_GPU = HAS_GPU and any(
     is_gpu(getattr(x, "device_type", "")) for x in _desired_test_bases
 )
 
+# PYTORCH_TEST_INDUCTOR_RUN_CPU=1 runs the CPU tests even when
+# PYTORCH_TESTING_DEVICE_ONLY_FOR leaves CPU out. CI sets it for the nogpu_*
+# jobs, which run a CUDA build (so ONLY_FOR=cuda) on machines without a GPU.
 RUN_CPU = LazyVal(
     lambda: HAS_CPU
-    and any(getattr(x, "device_type", "") == "cpu" for x in _desired_test_bases)
+    and (
+        any(getattr(x, "device_type", "") == "cpu" for x in _desired_test_bases)
+        or os.environ.get("PYTORCH_TEST_INDUCTOR_RUN_CPU") == "1"
+    )
 )
 
 HAS_TPU = LazyVal(has_tpu_pallas)
 # TPU is a privateuse1 backend that isn't in _desired_test_bases (it requires
 # runtime initialization before the test base is registered). Check the env var
-# directly, matching the same semantics as RUN_CPU/RUN_GPU: when the env var is
+# directly, matching the same semantics as RUN_GPU: when the env var is
 # unset, run if the hardware is available; when set, only run if "tpu" is listed.
 RUN_TPU = LazyVal(
     lambda: HAS_TPU
