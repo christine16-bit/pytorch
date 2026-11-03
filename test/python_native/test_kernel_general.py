@@ -286,7 +286,8 @@ class TestKernelGeneral(TestCase):
 
     def test_family_kernels_are_listed(self):
         # New kernels must be listed here deliberately: TileReduce is the shared body for every
-        # axis and PartialColumns folds partition-major column partials. Glob files and match
+        # axis, PartialColumns folds partition-major column partials, and _OrderedColReduce
+        # preserves the row inner-tree order down columns. Glob files and match
         # qualified or annotated decorators so new drivers and spellings cannot evade the check.
         # Runtime introspection cannot distinguish @cute.kernel from @cute.jit wrappers.
         root = pathlib.Path(reductions.__file__).parent
@@ -297,7 +298,7 @@ class TestKernelGeneral(TestCase):
             for line in path.read_text().splitlines()
             if deco.match(line.strip())
         )
-        self.assertEqual(found, {"tile.py": 1, "kernel_coltile.py": 1})
+        self.assertEqual(found, {"tile.py": 1, "kernel_coltile.py": 2})
 
     def test_internal_invariants_raise(self):
         # Each invariant must raise explicitly because python -O strips asserts. Exercise every
